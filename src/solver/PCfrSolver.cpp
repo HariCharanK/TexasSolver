@@ -433,7 +433,9 @@ PCfrSolver::actionUtility(int player, shared_ptr<ActionNode> node, const vector<
     }
 #endif
 
-    const vector<float> current_strategy = trainable->getcurrentStrategy();
+    const vector<float> current_strategy = node->isLocked()
+        ? node->getLockedStrategy((int)node_player_private_cards.size())
+        : trainable->getcurrentStrategy();
 #ifdef DEBUG
     if (current_strategy.size() != actions.size() * node_player_private_cards.size()) {
         node->printHistory();
@@ -519,7 +521,7 @@ PCfrSolver::actionUtility(int player, shared_ptr<ActionNode> node, const vector<
             }
         }
 
-        if(!this->distributing_task && !this->collecting_statics) {
+        if(!this->distributing_task && !this->collecting_statics && !node->isLocked()) {
             if (iter > this->warmup) {
                 trainable->updateRegrets(regrets, iter + 1, reach_probs);
             }/*else if(iter < this->warmup){
@@ -909,7 +911,14 @@ void PCfrSolver::reConvertJson(const shared_ptr<GameTreeNode>& node,json& strate
         }
         shared_ptr<Trainable> trainable = one_node->getTrainable(deal,false);
         if(trainable != nullptr) {
-            (*retval)["strategy"] = trainable->dump_strategy(false);
+            json strategy_json = trainable->dump_strategy(false);
+            if (one_node->isLocked()) {
+                const vector<float>& lp = one_node->getLockedProbs();
+                for (auto& [hand, hand_probs] : strategy_json["strategy"].items()) {
+                    strategy_json["strategy"][hand] = vector<float>(lp.begin(), lp.end());
+                }
+            }
+            (*retval)["strategy"] = strategy_json;
             for(vector<int> one_exchange:exchange_color_list){
                 int rank1 = one_exchange[0];
                 int rank2 = one_exchange[1];

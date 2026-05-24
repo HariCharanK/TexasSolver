@@ -26,13 +26,13 @@ CommandLineTool::CommandLineTool(string mode,string resource_dir) {
     string logfile_name = "../resources/outputs/outputs_log.txt";
     this->ps = PokerSolver(ranks,suits,compairer_file,lines,compairer_file_bin);
 
-    StreetSetting gbs_flop_ip = StreetSetting(vector<float>{},vector<float>{},vector<float>{},true);
-    StreetSetting gbs_turn_ip = StreetSetting(vector<float>{},vector<float>{},vector<float>{},true);
-    StreetSetting gbs_river_ip = StreetSetting(vector<float>{},vector<float>{},vector<float>{},true);
+    StreetSetting gbs_flop_ip = StreetSetting(vector<float>{},vector<float>{},vector<float>{},false);
+    StreetSetting gbs_turn_ip = StreetSetting(vector<float>{},vector<float>{},vector<float>{},false);
+    StreetSetting gbs_river_ip = StreetSetting(vector<float>{},vector<float>{},vector<float>{},false);
 
-    StreetSetting gbs_flop_oop = StreetSetting(vector<float>{},vector<float>{},vector<float>{},true);
-    StreetSetting gbs_turn_oop = StreetSetting(vector<float>{},vector<float>{},vector<float>{},true);
-    StreetSetting gbs_river_oop = StreetSetting(vector<float>{},vector<float>{},vector<float>{},true);
+    StreetSetting gbs_flop_oop = StreetSetting(vector<float>{},vector<float>{},vector<float>{},false);
+    StreetSetting gbs_turn_oop = StreetSetting(vector<float>{},vector<float>{},vector<float>{},false);
+    StreetSetting gbs_river_oop = StreetSetting(vector<float>{},vector<float>{},vector<float>{},false);
 
     this->gtbs = make_shared<GameTreeBuildingSettings>(gbs_flop_ip,gbs_turn_ip,gbs_river_ip,gbs_flop_oop,gbs_turn_oop,gbs_river_oop);
     //ps.build_game_tree(oop_commit,ip_commit,current_round,raise_limit,small_blind,big_blind,stack,*gtbs.get(),allin_threshold);
@@ -90,13 +90,171 @@ void split(const string& s, char c,
 }
 
 
+// ── Node locking helpers ──────────────────────────────────────────────────────
+
+map<string,float> CommandLineTool::parseFreqs(const string& s) {
+    map<string,float> result;
+    vector<string> pairs = string_split(s, ',');
+    for (auto& pair : pairs) {
+        size_t eq = pair.find('=');
+        if (eq == string::npos)
+            throw runtime_error("Freq format error. Expected: action=prob (e.g. fold=0.7,call=0.3,raise=0.0)");
+        result[pair.substr(0, eq)] = stof(pair.substr(eq + 1));
+    }
+    return result;
+}
+
+bool CommandLineTool::stepMatchesAction(GameActions action, const string& step) {
+    auto act = action.getAction();
+    if (step == "c")
+        return act == GameTreeNode::CALL || act == GameTreeNode::CHECK;
+    if (step == "k")
+        return act == GameTreeNode::CHECK;
+    if (step == "f")
+        return act == GameTreeNode::FOLD;
+    if (step.size() >= 2 && step[0] == 'b' && act == GameTreeNode::BET) {
+        double target = stod(step.substr(1));
+        return fabs(action.getAmount() - target) <= max(1.0, target * 0.05);
+    }
+    if (step.size() >= 2 && step[0] == 'r' && act == GameTreeNode::RAISE) {
+        double target = stod(step.substr(1));
+        return fabs(action.getAmount() - target) <= max(1.0, target * 0.05);
+    }
+    return false;
+}
+
+// "bet" or "raise" → player is facing aggression (has FOLD option)
+// "check"          → player is opening / first to act (has CHECK, no FOLD)
+// "any"            → all action nodes for this player
+bool CommandLineTool::nodeMatchesFacing(shared_ptr<ActionNode> node, const string& facing) {
+    if (facing == "any") return true;
+    bool has_fold = false, has_check = false;
+    for (auto& a : node->getActions()) {
+        if (a.getAction() == GameTreeNode::FOLD)  has_fold  = true;
+        if (a.getAction() == GameTreeNode::CHECK) has_check = true;
+    }
+    if (facing == "bet" || facing == "raise") return has_fold;
+    if (facing == "check") return has_check && !has_fold;
+    return false;
+}
+
+GameTreeNode::GameRound CommandLineTool::streetStrToRound(const string& s) {
+    if (s == "preflop") return GameTreeNode::GameRound::PREFLOP;
+    if (s == "flop")    return GameTreeNode::GameRound::FLOP;
+    if (s == "turn")    return GameTreeNode::GameRound::TURN;
+    if (s == "river")   return GameTreeNode::GameRound::RIVER;
+    throw runtime_error(fmt::format("Unknown street '{}'. Use: flop, turn, river", s));
+}
+
+void CommandLineTool::lockByPath(shared_ptr<GameTreeNode> node, const vector<string>& steps, int idx,
+                                 int player, const map<string,float>& freqs, int& count) {
+    if (!node) return;
+    if (node->getType() == GameTreeNode::ACTION) {
+        shared_ptr<ActionNode> an = dynamic_pointer_cast<ActionNode>(node);
+        if (idx >= (int)steps.size()) {
+            if (an->getPlayer() != player) {
+                string whose = (an->getPlayer() == 0) ? "ip" : "oop";
+                throw runtime_error(fmt::format(
+                    "Path leads to {}'s node, but you specified player {}. Did you swap ip/oop?",
+                    whose, player == 0 ? "ip" : "oop"));
+            }
+            an->lockNode(freqs);
+            count++;
+            return;
+        }
+        vector<GameActions>& actions = an->getActions();
+        int matched = -1;
+        for (int i = 0; i < (int)actions.size(); i++) {
+            if (stepMatchesAction(actions[i], steps[idx])) { matched = i; break; }
+        }
+        if (matched == -1) {
+            string available;
+            for (auto& a : actions) available += "'" + a.toString() + "' ";
+            throw runtime_error(fmt::format("No action matches step '{}'. Available: {}", steps[idx], available));
+        }
+        lockByPath(an->getChildrens()[matched], steps, idx + 1, player, freqs, count);
+    } else if (node->getType() == GameTreeNode::CHANCE) {
+        // ChanceNode has one shared child subtree; navigate through it
+        shared_ptr<ChanceNode> cn = dynamic_pointer_cast<ChanceNode>(node);
+        lockByPath(cn->getChildren(), steps, idx, player, freqs, count);
+    }
+    // SHOWDOWN / TERMINAL: nothing to lock
+}
+
+void CommandLineTool::lockByStreet(shared_ptr<GameTreeNode> node, GameTreeNode::GameRound target_round,
+                                   const string& facing, int player, const map<string,float>& freqs, int& count) {
+    if (!node) return;
+    if (node->getType() == GameTreeNode::ACTION) {
+        shared_ptr<ActionNode> an = dynamic_pointer_cast<ActionNode>(node);
+        if (an->getRound() == target_round && an->getPlayer() == player && nodeMatchesFacing(an, facing)) {
+            an->lockNode(freqs);
+            count++;
+        }
+        for (auto& child : an->getChildrens())
+            lockByStreet(child, target_round, facing, player, freqs, count);
+    } else if (node->getType() == GameTreeNode::CHANCE) {
+        shared_ptr<ChanceNode> cn = dynamic_pointer_cast<ChanceNode>(node);
+        lockByStreet(cn->getChildren(), target_round, facing, player, freqs, count);
+    }
+}
+
+// ── Command dispatcher ────────────────────────────────────────────────────────
+
 void CommandLineTool::processCommand(string input) {
-    vector<string> contents;
-    split(input,' ',contents);
-    if(contents.size() == 0) contents = {input};
-    if(contents.size() > 2 || contents.size() < 1)throw runtime_error(tfm::format("command not valid: %s",input));
+    // Trim trailing whitespace / carriage returns
+    while (!input.empty() && (input.back() == '\r' || input.back() == '\n' || input.back() == ' '))
+        input.pop_back();
+    if (input.empty()) return;
+
+    vector<string> contents = string_split(input, ' ');
+    if(contents.empty()) return;
+
+
     string command = contents[0];
+
+    // ── New multi-arg commands ──────────────────────────────────────────────
+
+    if (command == "lock_node") {
+        // lock_node <path> <ip|oop> <fold=F,call=C,...>
+        // path steps separated by ':' — b50, r100, c (call/check), k (check), f (fold)
+        if (contents.size() != 4)
+            throw runtime_error("Usage: lock_node <path> <ip|oop> <fold=F,call=C,...>\n"
+                                "  e.g. lock_node b50:c ip fold=0.7,call=0.3,raise=0.0");
+        if (!this->ps.getGameTree())
+            throw runtime_error("build_tree must be called before lock_node");
+        vector<string> steps = string_split(contents[1], ':');
+        int player = (contents[2] == "ip") ? 0 : 1;
+        map<string,float> freqs = parseFreqs(contents[3]);
+        int count = 0;
+        lockByPath(this->ps.getGameTree()->getRoot(), steps, 0, player, freqs, count);
+        cout << fmt::format("lock_node: locked {} node(s) at path '{}'", count, contents[1]) << endl;
+        return;
+    }
+
+    if (command == "lock_all_street") {
+        // lock_all_street <flop|turn|river> <ip|oop> <bet|check|any> <fold=F,call=C,...>
+        if (contents.size() != 5)
+            throw runtime_error("Usage: lock_all_street <flop|turn|river> <ip|oop> <bet|check|any> <fold=F,call=C,...>\n"
+                                "  e.g. lock_all_street flop oop bet fold=0.7,call=0.3,raise=0.0");
+        if (!this->ps.getGameTree())
+            throw runtime_error("build_tree must be called before lock_all_street");
+        GameTreeNode::GameRound target_round = streetStrToRound(contents[1]);
+        int player = (contents[2] == "ip") ? 0 : 1;
+        string facing = contents[3];
+        map<string,float> freqs = parseFreqs(contents[4]);
+        int count = 0;
+        lockByStreet(this->ps.getGameTree()->getRoot(), target_round, facing, player, freqs, count);
+        cout << fmt::format("lock_all_street: locked {} node(s) on {} for {} (facing: {})",
+                            count, contents[1], contents[2], facing) << endl;
+        return;
+    }
+
+    // ── Existing single-param commands ─────────────────────────────────────
+
+    if(contents.size() > 2 || contents.size() < 1)
+        throw runtime_error(fmt::format("command not valid: {}",input));
     string paramstr = contents.size() == 1 ? "" : contents[1];
+
     if(command == "set_pot"){
         this->ip_commit = stof(paramstr) / 2;
         this->oop_commit = stof(paramstr) / 2;
@@ -122,7 +280,6 @@ void CommandLineTool::processCommand(string input) {
         vector<string> params;
         split(paramstr,',',params);
         if(params.size() < 3)throw runtime_error("param number error");
-        // oop,turn,bet,30,70,100
         string player = params[0];
         string round = params[1];
         string bet_type = params[2];
@@ -136,7 +293,7 @@ void CommandLineTool::processCommand(string input) {
 
         if(bet_type == "bet" || bet_type == "raise" || bet_type == "donk"){
             sizes->clear();
-            for(std::size_t i = 3;i < params.size();i ++ ){
+            for(int i = 3;i < (int)params.size();i ++ ){
                 sizes->push_back(stof(params[i]));
             }
         }

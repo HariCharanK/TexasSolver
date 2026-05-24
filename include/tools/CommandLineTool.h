@@ -6,9 +6,12 @@
 #define BINDSOLVER_COMMANDLINETOOL_H
 #include <string>
 #include <vector>
+#include <map>
 #include <iostream>
 #include <fstream>
 #include "include/runtime/PokerSolver.h"
+#include "include/nodes/ActionNode.h"
+#include "include/nodes/ChanceNode.h"
 
 using namespace std;
 class CommandLineTool{
@@ -43,6 +46,14 @@ private:
     int print_interval=10;
     int dump_rounds = 1;
     shared_ptr<GameTreeBuildingSettings> gtbs;
+
+    // Node locking helpers
+    map<string,float> parseFreqs(const string& s);
+    bool stepMatchesAction(GameActions action, const string& step);
+    bool nodeMatchesFacing(shared_ptr<ActionNode> node, const string& facing);
+    static GameTreeNode::GameRound streetStrToRound(const string& s);
+    void lockByPath(shared_ptr<GameTreeNode> node, const vector<string>& steps, int idx, int player, const map<string,float>& freqs, int& count);
+    void lockByStreet(shared_ptr<GameTreeNode> node, GameTreeNode::GameRound target_round, const string& facing, int player, const map<string,float>& freqs, int& count);
 };
 
 #endif //BINDSOLVER_COMMANDLINETOOL_H
