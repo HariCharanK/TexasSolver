@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.15...3.28)
 project(bindSolver)
 set(CMAKE_OSX_DEPLOYMENT_TARGET 10.7)
 
@@ -78,9 +78,9 @@ add_subdirectory(ext/googletest/googletest)
 include_directories(ext/fmt/include ext/fmt)
 add_subdirectory(ext/fmt/)
 
-# ppybind11
-include_directories(ext/pybind11/include)
-add_subdirectory(ext/pybind11)
+# pybind11 disabled (requires distutils unavailable in Python 3.12+)
+# include_directories(ext/pybind11/include)
+# add_subdirectory(ext/pybind11)
 
 include_directories(include)
 
@@ -106,8 +106,7 @@ add_library(TexasSolver
         ${lib_src}
         )
 
-target_link_libraries(TexasSolver fmt)
-#target_link_libraries(TexasSolver ${Boost_LIBRARIES})
+target_link_libraries(TexasSolver fmt /opt/homebrew/opt/libomp/lib/libomp.dylib)
 
 add_executable(test test/test.cpp)
 add_executable(console_solver src/console.cpp)
